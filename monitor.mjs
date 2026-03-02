@@ -204,6 +204,7 @@ async function notifyProducts(products, eventType) {
   await Promise.all([sendTelegram(tgMsg), sendSms(smsMsg)]);
 
   // Log
+  mkdirSync('state', { recursive: true });
   const logLine = `[${new Date().toISOString()}] ${label}: ${products.map((p) => p.sku).join(', ')}\n`;
   appendFileSync(NOTIFY_LOG, logLine);
 }
