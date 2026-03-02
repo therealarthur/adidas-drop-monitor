@@ -1,29 +1,19 @@
 /**
  * Adidas F1 Audi Drop Monitor
- * Uses Playwright to bypass Akamai WAF, extracts products,
- * diffs against stored state, sends Telegram + SMS notifications.
+ * Uses Google Search + Adidas Newsroom to find products (bypasses Akamai WAF).
+ * Diffs against stored state, sends Telegram + SMS notifications
+ * with View and Add-to-Cart links.
  */
 
 import { chromium } from 'playwright';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'fs';
-import { execSync } from 'child_process';
 
 // Config
 const STATE_FILE = 'state/products.json';
 const NOTIFY_LOG = 'state/notifications.log';
-const COLLECTION_URL = 'https://www.adidas.com/us/audi_revolut_f1_team';
-const SEARCH_URLS = [
-  'https://www.adidas.com/us/search?q=audi+f1',
-  'https://www.adidas.com/us/search?q=audi+revolut+f1',
-];
 
-// Alternative data sources that bypass Akamai WAF
+// Google Cache fallback
 const GOOGLE_CACHE_URL = 'https://webcache.googleusercontent.com/search?q=cache:www.adidas.com/us/audi_revolut_f1_team';
-const SITEMAP_URLS = [
-  'https://www.adidas.com/sitemap.xml',
-  'https://www.adidas.com/us/sitemap.xml',
-  'https://www.adidas.com/on/demandware.static/-/Sites-adidas-US-Library/default/sitemap_index.xml',
-];
 const TEST_MODE = process.argv.includes('--test-notify');
 
 // Notification config from env
@@ -519,163 +509,38 @@ async function runMonitor() {
 
   const allProducts = new Map();
 
-  // Scrape collection page
-  try {
-    log(`Navigating to: ${COLLECTION_URL}`);
-    const response = await page.goto(COLLECTION_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 15000,
-    });
-    const initialStatus = response?.status();
-    log(`  Initial status: ${initialStatus}`);
+  // STRATEGY 1 (PRIMARY): Google Search for indexed Adidas product pages
+  // This bypasses Akamai entirely. Google indexes new pages within minutes to hours.
+  const googleQueries = [
+    'site:adidas.com/us "audi revolut f1"',
+    'site:adidas.com/us "audi f1" team',
+    'site:adidas.com/us audi_revolut_f1_team',
+  ];
 
-    // Akamai returns 403 with a JS challenge page.
-    // The browser needs time to execute the challenge JS which sets cookies
-    // and then redirects to the real page. Wait for this to happen.
-    if (initialStatus === 403) {
-      log('  Got 403 (likely Akamai JS challenge). Waiting for challenge resolution...');
-      // Wait for Akamai challenge JS to execute and redirect
-      try {
-        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 });
-        log(`  Post-challenge URL: ${page.url()}`);
-      } catch {
-        log('  No navigation after challenge, waiting longer...');
-      }
-      // Give extra time for any additional JS
-      await page.waitForTimeout(5000);
-    }
-
-    // Now check current page state (may have changed after challenge)
-    const currentUrl = page.url();
-    const title = await page.title();
-    log(`  Current URL: ${currentUrl}`);
-    log(`  Page title: ${title}`);
-
-    // Debug: dump page content size and snippet
-    const content = await page.content();
-    log(`  Page content: ${content.length} chars`);
-    log(`  First 300 chars: ${content.slice(0, 300).replace(/\n/g, ' ')}`);
-
-    // Check if we actually got through (page title should not be just "adidas")
-    const isBlocked = content.length < 5000 && (title === 'adidas' || content.includes('var_country'));
-    if (isBlocked) {
-      log('  Still blocked by Akamai after challenge wait');
-    }
-
-    // Try to extract products regardless of whether we think we're blocked
-    // (the page might have partial content)
+  for (const query of googleQueries) {
     try {
-      await page.waitForSelector(
-        '[data-testid="product-card"], [data-auto-id="product-card"], .product-card, article[data-index], a[href*=".html"]',
-        { timeout: 10000 }
-      );
-      log('  Product elements detected on page');
-    } catch {
-      log('  No product card selectors found, extracting what we can...');
-    }
-
-    // Scroll to trigger lazy loading
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-    await page.waitForTimeout(1500);
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1500);
-
-    const products = await extractProducts(page);
-    for (const p of products) {
-      if (p.sku) allProducts.set(p.sku, p);
-    }
-    log(`  Collection page: ${products.length} products extracted`);
-  } catch (err) {
-    log(`  Collection page failed: ${err.message}`);
-  }
-
-  // Scrape search pages (after collection, cookies from Akamai challenge may carry over)
-  for (const searchUrl of SEARCH_URLS) {
-    try {
-      log(`Navigating to: ${searchUrl}`);
-      const response = await page.goto(searchUrl, {
+      const encodedQuery = encodeURIComponent(query);
+      log(`Google search: ${query}`);
+      await page.goto(`https://www.google.com/search?q=${encodedQuery}&num=50`, {
         waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      });
-      const status = response?.status();
-      log(`  Initial status: ${status}`);
-
-      if (status === 403) {
-        // Wait for Akamai challenge (cookies may already be set from collection page)
-        try {
-          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 });
-        } catch {}
-        await page.waitForTimeout(3000);
-      } else {
-        await page.waitForTimeout(3000);
-      }
-
-      const content = await page.content();
-      log(`  Page content: ${content.length} chars`);
-
-      // Scroll to load more
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1500);
-
-      const products = await extractProducts(page);
-      for (const p of products) {
-        if (p.sku && !allProducts.has(p.sku)) {
-          allProducts.set(p.sku, p);
-        }
-      }
-      log(`  Search page: ${products.length} products extracted`);
-    } catch (err) {
-      log(`  Search page failed: ${err.message}`);
-    }
-  }
-
-  // FALLBACK: If Akamai blocked direct access, try Google Cache
-  if (allProducts.size === 0) {
-    log('Direct access blocked by Akamai. Trying Google Cache...');
-    try {
-      const cacheResp = await page.goto(GOOGLE_CACHE_URL, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-      });
-      log(`  Google Cache status: ${cacheResp?.status()}`);
-      if (cacheResp?.status() === 200) {
-        await page.waitForTimeout(2000);
-        const cacheContent = await page.content();
-        log(`  Google Cache content: ${cacheContent.length} chars`);
-        const products = await extractProducts(page);
-        for (const p of products) {
-          if (p.sku) allProducts.set(p.sku, p);
-        }
-        log(`  Google Cache: ${products.length} products extracted`);
-      }
-    } catch (err) {
-      log(`  Google Cache failed: ${err.message}`);
-    }
-  }
-
-  // FALLBACK 2: Try Google search for new products
-  if (allProducts.size === 0) {
-    log('Trying Google search for Adidas Audi F1 products...');
-    try {
-      await page.goto('https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
+        timeout: 20000,
       });
       await page.waitForTimeout(2000);
 
       // Extract product URLs from Google search results
       const googleProducts = await page.evaluate(() => {
         const results = [];
-        // Google search result links
         const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
         for (const link of links) {
           const href = link.getAttribute('href') || '';
           const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
           if (skuMatch) {
-            const name = link.textContent.trim() || skuMatch[1].replace(/-/g, ' ');
+            // Get the title text from the search result
+            const titleEl = link.closest('[data-snhf]')?.querySelector('h3') || link.querySelector('h3') || link;
+            const name = titleEl.textContent.trim().replace(/adidas\s*/i, '').replace(/\s*\|.*$/, '').trim();
             results.push({
               sku: skuMatch[2],
-              name: name.replace(/adidas/i, '').trim(),
+              name: name || skuMatch[1].replace(/-/g, ' '),
               price: '',
               url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
             });
@@ -689,40 +554,68 @@ async function runMonitor() {
           allProducts.set(p.sku, p);
         }
       }
-      log(`  Google search: ${googleProducts.length} products found`);
+      log(`  Found ${googleProducts.length} product links (${allProducts.size} unique total)`);
     } catch (err) {
       log(`  Google search failed: ${err.message}`);
     }
   }
 
-  // FALLBACK 3: Try fetching sitemap for product URLs
-  if (allProducts.size === 0) {
-    log('Trying Adidas sitemaps...');
-    for (const sitemapUrl of SITEMAP_URLS) {
-      try {
-        const resp = await page.goto(sitemapUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15000,
-        });
-        if (resp?.status() === 200) {
-          const content = await page.content();
-          log(`  Sitemap ${sitemapUrl}: ${content.length} chars`);
-          // Extract product URLs from sitemap XML
-          const urls = content.match(/https:\/\/www\.adidas\.com\/us\/[^<]*?\/[A-Z][A-Z0-9]{3,9}\.html/g) || [];
-          const audiUrls = urls.filter(u => u.toLowerCase().includes('audi'));
-          log(`  Found ${urls.length} total product URLs, ${audiUrls.length} Audi-related`);
-          for (const url of audiUrls) {
-            const skuMatch = url.match(/\/([A-Z][A-Z0-9]{3,9})\.html/);
-            if (skuMatch && !allProducts.has(skuMatch[1])) {
-              const name = url.split('/us/')[1]?.split('/')[0]?.replace(/-/g, ' ') || skuMatch[1];
-              allProducts.set(skuMatch[1], { sku: skuMatch[1], name, price: '', url });
-            }
-          }
+  // STRATEGY 2: Adidas Newsroom (not behind Akamai WAF, catches announcements early)
+  try {
+    log('Checking Adidas Newsroom for new Audi F1 announcements...');
+    await page.goto('https://news.adidas.com/motorsport', {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000,
+    });
+    await page.waitForTimeout(1500);
+
+    // Extract any product links from newsroom articles
+    const newsProducts = await page.evaluate(() => {
+      const results = [];
+      const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
+      for (const link of links) {
+        const href = link.getAttribute('href') || '';
+        const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
+        if (skuMatch) {
+          results.push({
+            sku: skuMatch[2],
+            name: link.textContent.trim() || skuMatch[1].replace(/-/g, ' '),
+            price: '',
+            url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
+          });
         }
-      } catch (err) {
-        log(`  Sitemap ${sitemapUrl} failed: ${err.message}`);
       }
-      if (allProducts.size > 0) break;
+      return results;
+    });
+
+    for (const p of newsProducts) {
+      if (p.sku && !allProducts.has(p.sku)) {
+        allProducts.set(p.sku, p);
+      }
+    }
+    log(`  Newsroom: ${newsProducts.length} product links found`);
+  } catch (err) {
+    log(`  Newsroom check failed: ${err.message}`);
+  }
+
+  // STRATEGY 3 (FALLBACK): Google Cache of collection page
+  if (allProducts.size === 0) {
+    log('No products from search. Trying Google Cache...');
+    try {
+      const cacheResp = await page.goto(GOOGLE_CACHE_URL, {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000,
+      });
+      if (cacheResp?.status() === 200) {
+        await page.waitForTimeout(2000);
+        const products = await extractProducts(page);
+        for (const p of products) {
+          if (p.sku) allProducts.set(p.sku, p);
+        }
+        log(`  Google Cache: ${products.length} products extracted`);
+      }
+    } catch (err) {
+      log(`  Google Cache failed: ${err.message}`);
     }
   }
 
