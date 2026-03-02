@@ -509,54 +509,90 @@ async function runMonitor() {
 
   const allProducts = new Map();
 
-  // STRATEGY 1 (PRIMARY): Google Search for indexed Adidas product pages
-  // This bypasses Akamai entirely. Google indexes new pages within minutes to hours.
-  const googleQueries = [
-    'site:adidas.com/us "audi revolut f1"',
-    'site:adidas.com/us "audi f1" team',
-    'site:adidas.com/us audi_revolut_f1_team',
-  ];
-
-  for (const query of googleQueries) {
-    try {
-      const encodedQuery = encodeURIComponent(query);
-      log(`Google search: ${query}`);
-      await page.goto(`https://www.google.com/search?q=${encodedQuery}&num=50`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20000,
-      });
-      await page.waitForTimeout(2000);
-
-      // Extract product URLs from Google search results
-      const googleProducts = await page.evaluate(() => {
-        const results = [];
-        const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
-        for (const link of links) {
-          const href = link.getAttribute('href') || '';
-          const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
-          if (skuMatch) {
-            // Get the title text from the search result
-            const titleEl = link.closest('[data-snhf]')?.querySelector('h3') || link.querySelector('h3') || link;
-            const name = titleEl.textContent.trim().replace(/adidas\s*/i, '').replace(/\s*\|.*$/, '').trim();
-            results.push({
-              sku: skuMatch[2],
-              name: name || skuMatch[1].replace(/-/g, ' '),
-              price: '',
-              url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
-            });
-          }
-        }
-        return results;
-      });
-
-      for (const p of googleProducts) {
-        if (p.sku && !allProducts.has(p.sku)) {
-          allProducts.set(p.sku, p);
+  /**
+   * Helper: extract Adidas Audi F1 product links from any search results page
+   * @param {import('playwright').Page} pg - Playwright page
+   * @returns {Promise<Array>} products found
+   */
+  async function extractSearchResults(pg) {
+    return pg.evaluate(() => {
+      const results = [];
+      // Match any link pointing to an Adidas product page
+      const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
+      for (const link of links) {
+        const href = link.getAttribute('href') || '';
+        const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
+        if (skuMatch) {
+          const titleEl = link.closest('li')?.querySelector('h3, h2') || link.querySelector('h3') || link;
+          const name = titleEl.textContent.trim().replace(/adidas\s*/i, '').replace(/\s*[\|:].*$/, '').trim();
+          results.push({
+            sku: skuMatch[2],
+            name: name || skuMatch[1].replace(/-/g, ' '),
+            price: '',
+            url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
+          });
         }
       }
-      log(`  Found ${googleProducts.length} product links (${allProducts.size} unique total)`);
-    } catch (err) {
-      log(`  Google search failed: ${err.message}`);
+      return results;
+    });
+  }
+
+  // STRATEGY 1 (PRIMARY): Multiple search engines for Adidas product pages
+  // Bypasses Akamai entirely. Uses Google + Bing + DuckDuckGo for reliability.
+  const searchSources = [
+    {
+      name: 'Google',
+      urls: [
+        'https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50',
+        'https://www.google.com/search?q=site:adidas.com/us+%22audi+f1%22+team&num=50',
+      ],
+    },
+    {
+      name: 'Bing',
+      urls: [
+        'https://www.bing.com/search?q=site%3Aadidas.com%2Fus+%22audi+revolut+f1%22&count=50',
+        'https://www.bing.com/search?q=site%3Aadidas.com%2Fus+%22audi+f1%22+team&count=50',
+      ],
+    },
+    {
+      name: 'DuckDuckGo',
+      urls: [
+        'https://html.duckduckgo.com/html/?q=site%3Aadidas.com%2Fus+audi+revolut+f1+team',
+      ],
+    },
+  ];
+
+  for (const source of searchSources) {
+    for (const url of source.urls) {
+      try {
+        log(`${source.name} search: ${decodeURIComponent(url.split('?q=')[1]?.split('&')[0] || url)}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.waitForTimeout(2000);
+
+        // Debug: check if we got a CAPTCHA or block
+        const pageTitle = await page.title();
+        const content = await page.content();
+        if (content.includes('captcha') || content.includes('CAPTCHA') || content.includes('unusual traffic')) {
+          log(`  ${source.name} served a CAPTCHA, skipping`);
+          continue;
+        }
+        log(`  Page title: "${pageTitle}" (${content.length} chars)`);
+
+        const products = await extractSearchResults(page);
+        for (const p of products) {
+          if (p.sku && !allProducts.has(p.sku)) {
+            allProducts.set(p.sku, p);
+          }
+        }
+        log(`  Found ${products.length} product links (${allProducts.size} unique total)`);
+      } catch (err) {
+        log(`  ${source.name} search failed: ${err.message}`);
+      }
+    }
+    // If we found products from this engine, no need to try others
+    if (allProducts.size > 0) {
+      log(`  Got results from ${source.name}, skipping remaining engines`);
+      break;
     }
   }
 
