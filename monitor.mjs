@@ -524,7 +524,7 @@ async function runMonitor() {
     log(`Navigating to: ${COLLECTION_URL}`);
     const response = await page.goto(COLLECTION_URL, {
       waitUntil: 'domcontentloaded',
-      timeout: 60000,
+      timeout: 15000,
     });
     const initialStatus = response?.status();
     log(`  Initial status: ${initialStatus}`);
@@ -595,7 +595,7 @@ async function runMonitor() {
       log(`Navigating to: ${searchUrl}`);
       const response = await page.goto(searchUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: 60000,
+        timeout: 15000,
       });
       const status = response?.status();
       log(`  Initial status: ${status}`);
