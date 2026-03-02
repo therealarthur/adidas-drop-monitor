@@ -36,3 +36,4 @@ Click "Run workflow" on the Actions tab to trigger a manual run.
 
 Product state is stored in `state/products.json` via GitHub Actions cache.
 This persists across runs so only genuinely new products trigger alerts.
+
