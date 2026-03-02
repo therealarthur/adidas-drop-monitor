@@ -1,20 +1,25 @@
 /**
- * Adidas F1 Audi Drop Monitor
- * Uses Google Search + Adidas Newsroom to find products (bypasses Akamai WAF).
+ * Adidas F1 Audi Drop Monitor v0.3.0
+ * Uses Adidas public sitemaps (not behind Akamai WAF) to detect products.
+ * No browser needed, just fetch().
  * Diffs against stored state, sends Telegram + SMS notifications
  * with View and Add-to-Cart links.
  */
 
-import { chromium } from 'playwright';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'fs';
 
 // Config
 const STATE_FILE = 'state/products.json';
 const NOTIFY_LOG = 'state/notifications.log';
 
-// Google Cache fallback
-const GOOGLE_CACHE_URL = 'https://webcache.googleusercontent.com/search?q=cache:www.adidas.com/us/audi_revolut_f1_team';
+// Adidas sitemap URLs (NOT behind Akamai WAF, freely accessible from datacenter IPs)
+const PRODUCT_SITEMAP = 'https://www.adidas.com/glass/sitemaps/adidas/US/en/sitemaps/adidas-US-en-us-product.xml';
+const SITEMAP_INDEX = 'https://www.adidas.com/glass/sitemaps/adidas/US/en/sitemap-index.xml';
 const TEST_MODE = process.argv.includes('--test-notify');
+
+// Audi filter: match URLs containing "audi" but NOT "saudi"
+const AUDI_FILTER = /audi/i;
+const SAUDI_EXCLUSION = /saudi/i;
 
 // Notification config from env
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -68,7 +73,6 @@ function saveState(state) {
  * @returns {string} ATC URL
  */
 function buildAtcUrl(sku, productUrl, size) {
-  // Adidas ATC pattern: product page with size query param
   if (productUrl && productUrl.includes('.html')) {
     return `${productUrl}?size=${encodeURIComponent(size)}`;
   }
@@ -103,7 +107,7 @@ async function sendTelegram(text) {
     }
     log(`  Telegram error: ${JSON.stringify(data)}`);
     // Retry without markdown if parse failed
-    if (data.description && data.description.includes("parse")) {
+    if (data.description && data.description.includes('parse')) {
       const retry = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -208,253 +212,208 @@ async function notifyProducts(products, eventType) {
 }
 
 /**
- * Extract products from a Playwright page
- * Tries multiple strategies: __NEXT_DATA__, data attributes, DOM scraping
- * @param {import('playwright').Page} page - Playwright page
- * @returns {Promise<Array>} Array of product objects
+ * Fetch a URL with retries and timeout
+ * @param {string} url - URL to fetch
+ * @param {number} timeoutMs - Timeout in milliseconds
+ * @param {number} retries - Number of retries
+ * @returns {Promise<{status: number, text: string}>} Response
  */
-async function extractProducts(page) {
-  const products = [];
-  const seenSkus = new Set();
-
-  // Strategy 1: Extract from __NEXT_DATA__ JSON
-  try {
-    const nextData = await page.evaluate(() => {
-      const el = document.querySelector('script#__NEXT_DATA__');
-      if (el) return el.textContent;
-      return null;
-    });
-    if (nextData) {
-      log('  Found __NEXT_DATA__, extracting products...');
-      const parsed = JSON.parse(nextData);
-      const items = findProductsInObject(parsed);
-      for (const item of items) {
-        if (item.sku && !seenSkus.has(item.sku)) {
-          seenSkus.add(item.sku);
-          products.push(item);
-        }
-      }
-      log(`  __NEXT_DATA__ yielded ${items.length} products`);
-    }
-  } catch (err) {
-    log(`  __NEXT_DATA__ extraction failed: ${err.message}`);
-  }
-
-  // Strategy 2: Extract from data-testid product cards
-  try {
-    const domProducts = await page.evaluate(() => {
-      const results = [];
-
-      // Try common Adidas product card selectors
-      const selectors = [
-        '[data-testid="product-card"]',
-        '[data-auto-id="product-card"]',
-        '.product-card',
-        '.plp-card',
-        '[class*="product-card"]',
-        '[class*="ProductCard"]',
-        'article[data-index]',
-        '.glass-product-card',
-        '[data-testid="plp-product-card"]',
-      ];
-
-      for (const sel of selectors) {
-        const cards = document.querySelectorAll(sel);
-        if (cards.length === 0) continue;
-
-        for (const card of cards) {
-          const link = card.querySelector('a[href*="/us/"]');
-          const nameEl =
-            card.querySelector('[data-testid="product-card-title"]') ||
-            card.querySelector('[class*="product-card__title"]') ||
-            card.querySelector('[class*="ProductCard__title"]') ||
-            card.querySelector('h2') ||
-            card.querySelector('[class*="name"]');
-          const priceEl =
-            card.querySelector('[data-testid="product-card-price"]') ||
-            card.querySelector('[class*="price"]') ||
-            card.querySelector('[class*="Price"]');
-
-          const href = link ? link.getAttribute('href') : '';
-          const skuMatch = href.match(/\/([A-Z][A-Z0-9]{3,9})\.html/);
-
-          results.push({
-            sku: skuMatch ? skuMatch[1] : '',
-            name: nameEl ? nameEl.textContent.trim() : '',
-            price: priceEl ? priceEl.textContent.trim() : '',
-            url: href ? (href.startsWith('http') ? href : `https://www.adidas.com${href}`) : '',
-          });
-        }
-
-        if (results.length > 0) break;
-      }
-
-      return results;
-    });
-
-    for (const p of domProducts) {
-      if (p.sku && !seenSkus.has(p.sku)) {
-        seenSkus.add(p.sku);
-        products.push(p);
-      }
-    }
-    if (domProducts.length > 0) {
-      log(`  DOM card extraction yielded ${domProducts.length} products`);
-    }
-  } catch (err) {
-    log(`  DOM extraction failed: ${err.message}`);
-  }
-
-  // Strategy 3: Extract all product links from the page
-  try {
-    const linkProducts = await page.evaluate(() => {
-      const results = [];
-      const links = document.querySelectorAll('a[href*=".html"]');
-      for (const link of links) {
-        const href = link.getAttribute('href') || '';
-        const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
-        if (skuMatch) {
-          const name = skuMatch[1].replace(/-/g, ' ');
-          results.push({
-            sku: skuMatch[2],
-            name: link.textContent.trim() || name,
-            price: '',
-            url: href.startsWith('http') ? href : `https://www.adidas.com${href}`,
-          });
-        }
-      }
-      return results;
-    });
-
-    for (const p of linkProducts) {
-      if (p.sku && !seenSkus.has(p.sku)) {
-        seenSkus.add(p.sku);
-        products.push(p);
-      }
-    }
-    if (linkProducts.length > 0) {
-      log(`  Link extraction yielded ${linkProducts.length} products`);
-    }
-  } catch (err) {
-    log(`  Link extraction failed: ${err.message}`);
-  }
-
-  // Strategy 4: Look for JSON-LD structured data
-  try {
-    const jsonLd = await page.evaluate(() => {
-      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-      const results = [];
-      for (const script of scripts) {
-        try {
-          results.push(JSON.parse(script.textContent));
-        } catch {}
-      }
-      return results;
-    });
-
-    for (const data of jsonLd) {
-      const items = findProductsInJsonLd(data);
-      for (const item of items) {
-        if (item.sku && !seenSkus.has(item.sku)) {
-          seenSkus.add(item.sku);
-          products.push(item);
-        }
-      }
-    }
-  } catch (err) {
-    log(`  JSON-LD extraction failed: ${err.message}`);
-  }
-
-  return products;
-}
-
-/**
- * Recursively find product-like objects in a nested JSON structure
- * @param {*} obj - Object to search
- * @param {number} depth - Current recursion depth
- * @returns {Array} Array of product objects
- */
-function findProductsInObject(obj, depth = 0) {
-  const results = [];
-  if (depth > 15 || !obj || typeof obj !== 'object') return results;
-
-  // Check if this object looks like a product
-  if (obj.productId || obj.article_number || (obj.id && obj.name && typeof obj.id === 'string' && /^[A-Z][A-Z0-9]{3,9}$/.test(obj.id))) {
-    const sku = obj.productId || obj.article_number || obj.id || '';
-    if (sku && /^[A-Z][A-Z0-9]{3,9}$/.test(sku)) {
-      results.push({
-        sku,
-        name: obj.name || obj.displayName || obj.title || sku,
-        price: obj.price || obj.salePrice || obj.formattedPrice || '',
-        url: obj.link || obj.url || obj.pdpLink || '',
+async function fetchWithRetry(url, timeoutMs = 30000, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const resp = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; AdidasMonitor/1.0)',
+          'Accept': 'text/xml, application/xml, text/html',
+        },
+        signal: controller.signal,
       });
-    }
-  }
-
-  // Check arrays of items (common API pattern)
-  if (obj.items || obj.products || obj.itemList || obj.results) {
-    const list = obj.items || obj.products || obj.itemList || obj.results;
-    if (Array.isArray(list)) {
-      for (const item of list) {
-        results.push(...findProductsInObject(item, depth + 1));
+      clearTimeout(timer);
+      const text = await resp.text();
+      return { status: resp.status, text };
+    } catch (err) {
+      if (attempt < retries) {
+        log(`  Retry ${attempt + 1}/${retries} for ${url}: ${err.message}`);
+        continue;
       }
+      throw err;
     }
   }
-
-  // Recurse into all values
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      results.push(...findProductsInObject(item, depth + 1));
-    }
-  } else {
-    for (const key of Object.keys(obj)) {
-      results.push(...findProductsInObject(obj[key], depth + 1));
-    }
-  }
-
-  return results;
 }
 
 /**
- * Extract products from JSON-LD structured data
- * @param {*} data - JSON-LD object or array
- * @returns {Array} Array of product objects
+ * Extract Audi F1 product URLs from sitemap XML content
+ * Filters for URLs containing "audi" (excluding "saudi") with a valid product path
+ * @param {string} xml - Sitemap XML content
+ * @param {Map<string, Object>} products - Map to add discovered products to
+ * @returns {number} Count of new products added
  */
-function findProductsInJsonLd(data) {
-  const results = [];
-  if (!data) return results;
+function extractAudiProductsFromXml(xml, products) {
+  let added = 0;
+  // Match all <loc> tags in the sitemap
+  const locRegex = /<loc>\s*([^<]+?)\s*<\/loc>/g;
+  let match;
+  while ((match = locRegex.exec(xml)) !== null) {
+    const url = match[1];
 
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      results.push(...findProductsInJsonLd(item));
+    // Must contain "audi" but not "saudi"
+    if (!AUDI_FILTER.test(url) || SAUDI_EXCLUSION.test(url)) continue;
+
+    // Must be a product page URL pattern: /us/product-slug/SKU.html
+    const productMatch = url.match(/\/us\/([a-z0-9][a-z0-9-]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
+    if (!productMatch) continue;
+
+    const slug = productMatch[1];
+    const sku = productMatch[2];
+
+    if (!products.has(sku)) {
+      // Convert slug to human-readable name (e.g. "audi-revolut-f1-team-track-top" -> "Audi Revolut F1 Team Track Top")
+      const name = slug
+        .split('-')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      products.set(sku, {
+        sku,
+        name,
+        price: '',
+        url: url.startsWith('http') ? url : `https://www.adidas.com${url}`,
+      });
+      added++;
     }
-    return results;
+  }
+  return added;
+}
+
+/**
+ * Check if a sitemap XML is a sitemap index (contains <sitemap> entries)
+ * @param {string} xml - XML content
+ * @returns {string[]} Array of sub-sitemap URLs, empty if not an index
+ */
+function extractSubSitemapUrls(xml) {
+  const urls = [];
+  // Sitemap index has <sitemap><loc>...</loc></sitemap> entries
+  if (!xml.includes('<sitemapindex') && !xml.includes('<sitemap>')) return urls;
+
+  const sitemapRegex = /<sitemap>\s*<loc>\s*([^<]+?)\s*<\/loc>/g;
+  let match;
+  while ((match = sitemapRegex.exec(xml)) !== null) {
+    urls.push(match[1].trim());
+  }
+  return urls;
+}
+
+/**
+ * Fetch Adidas sitemaps and find all Audi F1 products
+ * Uses the public sitemap infrastructure which is NOT behind Akamai WAF
+ * @returns {Promise<Map<string, Object>>} Map of SKU to product data
+ */
+async function fetchSitemapProducts() {
+  const allProducts = new Map();
+
+  // Strategy 1: Fetch the main product sitemap directly
+  log('Fetching Adidas product sitemap...');
+  try {
+    const { status, text: xml } = await fetchWithRetry(PRODUCT_SITEMAP);
+    log(`  Product sitemap: HTTP ${status} (${xml.length} chars)`);
+
+    if (status === 200) {
+      // Check if this is a sitemap index or a direct sitemap
+      const subUrls = extractSubSitemapUrls(xml);
+      if (subUrls.length > 0) {
+        // It's a sitemap index, fetch relevant sub-sitemaps
+        log(`  Sitemap index with ${subUrls.length} sub-sitemaps`);
+        // Filter for sub-sitemaps that might contain product pages
+        // Fetch them in parallel batches of 5
+        const batchSize = 5;
+        for (let i = 0; i < subUrls.length; i += batchSize) {
+          const batch = subUrls.slice(i, i + batchSize);
+          const results = await Promise.allSettled(
+            batch.map((url) => fetchWithRetry(url, 30000, 1))
+          );
+          for (const result of results) {
+            if (result.status === 'fulfilled' && result.value.status === 200) {
+              const count = extractAudiProductsFromXml(result.value.text, allProducts);
+              if (count > 0) {
+                log(`  Found ${count} Audi products in sub-sitemap`);
+              }
+            }
+          }
+          // Early exit if we found products (optimization)
+          if (allProducts.size > 0 && i + batchSize >= subUrls.length * 0.5) {
+            log(`  Found ${allProducts.size} products, stopping sub-sitemap scan`);
+            break;
+          }
+        }
+      } else {
+        // Direct sitemap with <url> entries
+        const count = extractAudiProductsFromXml(xml, allProducts);
+        log(`  Found ${count} Audi F1 products in product sitemap`);
+      }
+    }
+  } catch (err) {
+    log(`  Product sitemap failed: ${err.message}`);
   }
 
-  if (data['@type'] === 'Product' || data['@type'] === 'IndividualProduct') {
-    results.push({
-      sku: data.sku || data.productID || data.identifier || '',
-      name: data.name || '',
-      price: data.offers?.price ? `$${data.offers.price}` : '',
-      url: data.url || '',
-    });
-  }
+  // Strategy 2: If nothing found, try the sitemap index to discover other sitemaps
+  if (allProducts.size === 0) {
+    log('No products in main sitemap. Checking sitemap index...');
+    try {
+      const { status, text: xml } = await fetchWithRetry(SITEMAP_INDEX);
+      log(`  Sitemap index: HTTP ${status} (${xml.length} chars)`);
 
-  if (data.itemListElement) {
-    for (const item of data.itemListElement) {
-      results.push(...findProductsInJsonLd(item.item || item));
+      if (status === 200) {
+        const subUrls = extractSubSitemapUrls(xml);
+        log(`  Found ${subUrls.length} sitemaps in index`);
+
+        // Filter for product-related sitemaps
+        const productSitemaps = subUrls.filter(
+          (u) => u.includes('product') || u.includes('plp')
+        );
+        log(`  ${productSitemaps.length} product/plp sitemaps to check`);
+
+        for (const url of productSitemaps) {
+          try {
+            const { status: s, text: subXml } = await fetchWithRetry(url, 30000, 1);
+            if (s === 200) {
+              // Could be another index level
+              const nestedUrls = extractSubSitemapUrls(subXml);
+              if (nestedUrls.length > 0) {
+                // Fetch nested sitemaps
+                const results = await Promise.allSettled(
+                  nestedUrls.map((u) => fetchWithRetry(u, 30000, 1))
+                );
+                for (const result of results) {
+                  if (result.status === 'fulfilled' && result.value.status === 200) {
+                    extractAudiProductsFromXml(result.value.text, allProducts);
+                  }
+                }
+              } else {
+                extractAudiProductsFromXml(subXml, allProducts);
+              }
+            }
+          } catch (err) {
+            log(`  Sub-sitemap ${url} failed: ${err.message}`);
+          }
+        }
+        log(`  Sitemap index scan found ${allProducts.size} Audi products`);
+      }
+    } catch (err) {
+      log(`  Sitemap index failed: ${err.message}`);
     }
   }
 
-  return results;
+  return allProducts;
 }
 
 /**
  * Main monitor function
- * Launches browser, scrapes products, diffs, notifies
+ * Fetches sitemaps, extracts Audi F1 products, diffs against state, notifies
  */
 async function runMonitor() {
-  log('Starting Adidas Audi F1 drop monitor');
+  log('Starting Adidas Audi F1 drop monitor (sitemap mode)');
 
   // Handle test notification mode
   if (TEST_MODE) {
@@ -482,233 +441,19 @@ async function runMonitor() {
   const prevSkus = new Set(Object.keys(prevState));
   log(`Previous state: ${prevSkus.size} known products`);
 
-  // Launch browser
-  log('Launching browser...');
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
-
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 },
-    locale: 'en-US',
-  });
-
-  // Remove webdriver flag
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  });
-
-  const page = await context.newPage();
-
-  const allProducts = new Map();
-
-  /**
-   * Helper: extract Adidas Audi F1 product SKUs and URLs from HTML text
-   * Handles URL-encoded links from search engine redirect wrappers
-   * @param {string} html - HTML content to search
-   * @returns {Array} products found
-   */
-  function extractProductsFromHtml(html) {
-    const results = [];
-    const seen = new Set();
-
-    // First, URL-decode the entire HTML to catch encoded URLs
-    // Search engines encode links like: https%3A%2F%2Fwww.adidas.com%2Fus%2F...
-    let decoded = html;
-    try {
-      // Decode multiple times in case of double-encoding
-      decoded = decodeURIComponent(html.replace(/&amp;/g, '&'));
-    } catch {
-      // Partial decode: manually replace common encodings
-      decoded = html
-        .replace(/%3A/gi, ':')
-        .replace(/%2F/gi, '/')
-        .replace(/%3F/gi, '?')
-        .replace(/%3D/gi, '=')
-        .replace(/%26/gi, '&')
-        .replace(/%2B/gi, '+')
-        .replace(/%22/gi, '"')
-        .replace(/&amp;/g, '&');
-    }
-
-    // Match Adidas product page URLs: /us/product-slug/SKU.html
-    const regex = /(?:https?:\/\/)?(?:www\.)?adidas\.com\/us\/([a-z0-9][a-z0-9-]+)\/([A-Z][A-Z0-9]{3,9})\.html/g;
-    let match;
-    while ((match = regex.exec(decoded)) !== null) {
-      const slug = match[1];
-      const sku = match[2];
-      if (!seen.has(sku)) {
-        seen.add(sku);
-        results.push({
-          sku,
-          name: slug.replace(/-/g, ' '),
-          price: '',
-          url: `https://www.adidas.com/us/${slug}/${sku}.html`,
-        });
-      }
-    }
-    return results;
-  }
-
-  // STRATEGY 1 (PRIMARY): Plain fetch() to DuckDuckGo Lite
-  // DuckDuckGo Lite is designed for lightweight/programmatic access.
-  // No JS required, no CAPTCHAs, returns simple HTML.
-  const ddgQueries = [
-    'site:adidas.com/us audi revolut f1',
-    'site:adidas.com/us "audi f1" team adidas',
-  ];
-
-  for (const query of ddgQueries) {
-    try {
-      log(`DuckDuckGo Lite: ${query}`);
-      const resp = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept': 'text/html',
-        },
-      });
-      const html = await resp.text();
-      log(`  Response: ${resp.status} (${html.length} chars)`);
-      const products = extractProductsFromHtml(html);
-      for (const p of products) {
-        if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
-      }
-      log(`  Found ${products.length} products (${allProducts.size} unique total)`);
-    } catch (err) {
-      log(`  DuckDuckGo Lite failed: ${err.message}`);
-    }
-  }
-
-  // STRATEGY 2: Plain fetch() to Google (no browser fingerprint)
-  if (allProducts.size === 0) {
-    const googleQueries = [
-      'site:adidas.com/us "audi revolut f1"',
-      'site:adidas.com/us "audi f1" team',
-    ];
-    for (const query of googleQueries) {
-      try {
-        log(`Google (fetch): ${query}`);
-        const resp = await fetch(`https://www.google.com/search?q=${encodeURIComponent(query)}&num=50`, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'en-US,en;q=0.9',
-          },
-        });
-        const html = await resp.text();
-        log(`  Response: ${resp.status} (${html.length} chars)`);
-        if (html.includes('captcha') || html.includes('unusual traffic')) {
-          log('  Google CAPTCHA detected, skipping');
-          continue;
-        }
-        const products = extractProductsFromHtml(html);
-        for (const p of products) {
-          if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
-        }
-        log(`  Found ${products.length} products (${allProducts.size} unique total)`);
-      } catch (err) {
-        log(`  Google fetch failed: ${err.message}`);
-      }
-    }
-  }
-
-  // STRATEGY 3: Playwright-based search (fallback, uses the open browser)
-  if (allProducts.size === 0) {
-    log('Fetch-based search found nothing. Trying Playwright browser search...');
-    try {
-      await page.goto('https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50', {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      });
-      await page.waitForTimeout(2000);
-      const content = await page.content();
-      if (!content.includes('captcha') && !content.includes('unusual traffic')) {
-        const products = extractProductsFromHtml(content);
-        for (const p of products) {
-          if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
-        }
-        log(`  Playwright Google: ${products.length} products found`);
-      } else {
-        log('  Playwright Google: CAPTCHA detected');
-      }
-    } catch (err) {
-      log(`  Playwright Google failed: ${err.message}`);
-    }
-  }
-
-  // STRATEGY 2: Adidas Newsroom (not behind Akamai WAF, catches announcements early)
-  try {
-    log('Checking Adidas Newsroom for new Audi F1 announcements...');
-    await page.goto('https://news.adidas.com/motorsport', {
-      waitUntil: 'domcontentloaded',
-      timeout: 15000,
-    });
-    await page.waitForTimeout(1500);
-
-    // Extract any product links from newsroom articles
-    const newsProducts = await page.evaluate(() => {
-      const results = [];
-      const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
-      for (const link of links) {
-        const href = link.getAttribute('href') || '';
-        const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
-        if (skuMatch) {
-          results.push({
-            sku: skuMatch[2],
-            name: link.textContent.trim() || skuMatch[1].replace(/-/g, ' '),
-            price: '',
-            url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
-          });
-        }
-      }
-      return results;
-    });
-
-    for (const p of newsProducts) {
-      if (p.sku && !allProducts.has(p.sku)) {
-        allProducts.set(p.sku, p);
-      }
-    }
-    log(`  Newsroom: ${newsProducts.length} product links found`);
-  } catch (err) {
-    log(`  Newsroom check failed: ${err.message}`);
-  }
-
-  // STRATEGY 3 (FALLBACK): Google Cache of collection page
-  if (allProducts.size === 0) {
-    log('No products from search. Trying Google Cache...');
-    try {
-      const cacheResp = await page.goto(GOOGLE_CACHE_URL, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      });
-      if (cacheResp?.status() === 200) {
-        await page.waitForTimeout(2000);
-        const products = await extractProducts(page);
-        for (const p of products) {
-          if (p.sku) allProducts.set(p.sku, p);
-        }
-        log(`  Google Cache: ${products.length} products extracted`);
-      }
-    } catch (err) {
-      log(`  Google Cache failed: ${err.message}`);
-    }
-  }
-
-  await browser.close();
-  log(`Total unique products found: ${allProducts.size}`);
+  // Fetch products from Adidas sitemaps
+  const allProducts = await fetchSitemapProducts();
+  log(`Total Audi F1 products found: ${allProducts.size}`);
 
   if (allProducts.size === 0) {
-    log('No products found across all sources. Keeping previous state.');
+    log('No products found in sitemaps. Keeping previous state.');
     log('Monitor run complete');
     return;
+  }
+
+  // Log all found products for debugging
+  for (const [sku, p] of allProducts) {
+    log(`  [${sku}] ${p.name}`);
   }
 
   // Diff against previous state
@@ -717,11 +462,6 @@ async function runMonitor() {
   const currentState = {};
 
   for (const [sku, product] of allProducts) {
-    // Normalize URL to full URL
-    if (product.url && !product.url.startsWith('http')) {
-      product.url = `https://www.adidas.com${product.url}`;
-    }
-
     currentState[sku] = {
       name: product.name,
       price: product.price,
@@ -731,18 +471,17 @@ async function runMonitor() {
     };
 
     if (!prevSkus.has(sku)) {
-      // Brand new product
+      // Brand new product never seen before
       newProducts.push({ ...product, type: 'new_drop' });
-    } else if (prevState[sku]?.outOfStock && !product.outOfStock) {
-      // Was out of stock, now back
+    } else if (prevState[sku]?.outOfStock) {
+      // Was marked out of stock (disappeared from sitemap previously), now it's back
       restockedProducts.push({ ...product, type: 'restock' });
     }
   }
 
-  // Check for products that disappeared (potential restock tracking)
+  // Track products that disappeared (for restock detection on next run)
   for (const sku of prevSkus) {
     if (!allProducts.has(sku)) {
-      // Product disappeared, mark as potentially out of stock for restock detection
       currentState[sku] = {
         ...prevState[sku],
         lastSeen: prevState[sku]?.lastSeen,
