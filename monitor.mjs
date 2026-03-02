@@ -510,89 +510,115 @@ async function runMonitor() {
   const allProducts = new Map();
 
   /**
-   * Helper: extract Adidas Audi F1 product links from any search results page
-   * @param {import('playwright').Page} pg - Playwright page
-   * @returns {Promise<Array>} products found
+   * Helper: extract Adidas Audi F1 product SKUs and URLs from HTML text
+   * @param {string} html - HTML content to search
+   * @returns {Array} products found
    */
-  async function extractSearchResults(pg) {
-    return pg.evaluate(() => {
-      const results = [];
-      // Match any link pointing to an Adidas product page
-      const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
-      for (const link of links) {
-        const href = link.getAttribute('href') || '';
-        const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
-        if (skuMatch) {
-          const titleEl = link.closest('li')?.querySelector('h3, h2') || link.querySelector('h3') || link;
-          const name = titleEl.textContent.trim().replace(/adidas\s*/i, '').replace(/\s*[\|:].*$/, '').trim();
-          results.push({
-            sku: skuMatch[2],
-            name: name || skuMatch[1].replace(/-/g, ' '),
-            price: '',
-            url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
-          });
-        }
-      }
-      return results;
-    });
-  }
-
-  // STRATEGY 1 (PRIMARY): Multiple search engines for Adidas product pages
-  // Bypasses Akamai entirely. Uses Google + Bing + DuckDuckGo for reliability.
-  const searchSources = [
-    {
-      name: 'Google',
-      urls: [
-        'https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50',
-        'https://www.google.com/search?q=site:adidas.com/us+%22audi+f1%22+team&num=50',
-      ],
-    },
-    {
-      name: 'Bing',
-      urls: [
-        'https://www.bing.com/search?q=site%3Aadidas.com%2Fus+%22audi+revolut+f1%22&count=50',
-        'https://www.bing.com/search?q=site%3Aadidas.com%2Fus+%22audi+f1%22+team&count=50',
-      ],
-    },
-    {
-      name: 'DuckDuckGo',
-      urls: [
-        'https://html.duckduckgo.com/html/?q=site%3Aadidas.com%2Fus+audi+revolut+f1+team',
-      ],
-    },
-  ];
-
-  for (const source of searchSources) {
-    for (const url of source.urls) {
-      try {
-        log(`${source.name} search: ${decodeURIComponent(url.split('?q=')[1]?.split('&')[0] || url)}`);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await page.waitForTimeout(2000);
-
-        // Debug: check if we got a CAPTCHA or block
-        const pageTitle = await page.title();
-        const content = await page.content();
-        if (content.includes('captcha') || content.includes('CAPTCHA') || content.includes('unusual traffic')) {
-          log(`  ${source.name} served a CAPTCHA, skipping`);
-          continue;
-        }
-        log(`  Page title: "${pageTitle}" (${content.length} chars)`);
-
-        const products = await extractSearchResults(page);
-        for (const p of products) {
-          if (p.sku && !allProducts.has(p.sku)) {
-            allProducts.set(p.sku, p);
-          }
-        }
-        log(`  Found ${products.length} product links (${allProducts.size} unique total)`);
-      } catch (err) {
-        log(`  ${source.name} search failed: ${err.message}`);
+  function extractProductsFromHtml(html) {
+    const results = [];
+    const seen = new Set();
+    // Match Adidas product page URLs: /us/product-slug/SKU.html
+    const regex = /https?:\/\/(?:www\.)?adidas\.com\/us\/([^/"]+)\/([A-Z][A-Z0-9]{3,9})\.html/g;
+    let match;
+    while ((match = regex.exec(html)) !== null) {
+      const slug = match[1];
+      const sku = match[2];
+      if (!seen.has(sku)) {
+        seen.add(sku);
+        results.push({
+          sku,
+          name: slug.replace(/-/g, ' '),
+          price: '',
+          url: `https://www.adidas.com/us/${slug}/${sku}.html`,
+        });
       }
     }
-    // If we found products from this engine, no need to try others
-    if (allProducts.size > 0) {
-      log(`  Got results from ${source.name}, skipping remaining engines`);
-      break;
+    return results;
+  }
+
+  // STRATEGY 1 (PRIMARY): Plain fetch() to DuckDuckGo Lite
+  // DuckDuckGo Lite is designed for lightweight/programmatic access.
+  // No JS required, no CAPTCHAs, returns simple HTML.
+  const ddgQueries = [
+    'site:adidas.com/us audi revolut f1',
+    'site:adidas.com/us "audi f1" team adidas',
+  ];
+
+  for (const query of ddgQueries) {
+    try {
+      log(`DuckDuckGo Lite: ${query}`);
+      const resp = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'Accept': 'text/html',
+        },
+      });
+      const html = await resp.text();
+      log(`  Response: ${resp.status} (${html.length} chars)`);
+      const products = extractProductsFromHtml(html);
+      for (const p of products) {
+        if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
+      }
+      log(`  Found ${products.length} products (${allProducts.size} unique total)`);
+    } catch (err) {
+      log(`  DuckDuckGo Lite failed: ${err.message}`);
+    }
+  }
+
+  // STRATEGY 2: Plain fetch() to Google (no browser fingerprint)
+  if (allProducts.size === 0) {
+    const googleQueries = [
+      'site:adidas.com/us "audi revolut f1"',
+      'site:adidas.com/us "audi f1" team',
+    ];
+    for (const query of googleQueries) {
+      try {
+        log(`Google (fetch): ${query}`);
+        const resp = await fetch(`https://www.google.com/search?q=${encodeURIComponent(query)}&num=50`, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        const html = await resp.text();
+        log(`  Response: ${resp.status} (${html.length} chars)`);
+        if (html.includes('captcha') || html.includes('unusual traffic')) {
+          log('  Google CAPTCHA detected, skipping');
+          continue;
+        }
+        const products = extractProductsFromHtml(html);
+        for (const p of products) {
+          if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
+        }
+        log(`  Found ${products.length} products (${allProducts.size} unique total)`);
+      } catch (err) {
+        log(`  Google fetch failed: ${err.message}`);
+      }
+    }
+  }
+
+  // STRATEGY 3: Playwright-based search (fallback, uses the open browser)
+  if (allProducts.size === 0) {
+    log('Fetch-based search found nothing. Trying Playwright browser search...');
+    try {
+      await page.goto('https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50', {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000,
+      });
+      await page.waitForTimeout(2000);
+      const content = await page.content();
+      if (!content.includes('captcha') && !content.includes('unusual traffic')) {
+        const products = extractProductsFromHtml(content);
+        for (const p of products) {
+          if (!allProducts.has(p.sku)) allProducts.set(p.sku, p);
+        }
+        log(`  Playwright Google: ${products.length} products found`);
+      } else {
+        log('  Playwright Google: CAPTCHA detected');
+      }
+    } catch (err) {
+      log(`  Playwright Google failed: ${err.message}`);
     }
   }
 
