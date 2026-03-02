@@ -460,14 +460,19 @@ async function runMonitor() {
 
   // Handle test notification mode
   if (TEST_MODE) {
-    log('TEST MODE: Sending test notifications...');
+    log('TEST MODE: Sending test notifications with real products...');
     const testProducts = [
       {
-        sku: 'TEST001',
-        name: 'Audi F1 Team Tee (TEST)',
-        price: '$65.00',
-        url: 'https://www.adidas.com/us/audi_revolut_f1_team',
-        type: 'new_drop',
+        sku: 'KE8919',
+        name: 'Audi Revolut F1 Team Engineers & Marketing Track Top',
+        price: '$110.00',
+        url: 'https://www.adidas.com/us/audi-revolut-f1-team-engineers-marketing-track-top/KE8919.html',
+      },
+      {
+        sku: 'KE6123',
+        name: 'Audi Revolut F1 Team DNA Graphic Tee',
+        price: '$45.00',
+        url: 'https://www.adidas.com/us/audi-revolut-f1-team-dna-graphic-tee/KE6123.html',
       },
     ];
     await notifyProducts(testProducts, 'new_drop');
@@ -511,72 +516,106 @@ async function runMonitor() {
     log(`Navigating to: ${COLLECTION_URL}`);
     const response = await page.goto(COLLECTION_URL, {
       waitUntil: 'domcontentloaded',
-      timeout: 45000,
+      timeout: 60000,
     });
-    log(`  Status: ${response?.status()}`);
+    const initialStatus = response?.status();
+    log(`  Initial status: ${initialStatus}`);
 
-    if (response?.status() === 200) {
-      // Wait for product content to load
-      await page.waitForTimeout(3000);
-
-      // Try to wait for product cards
+    // Akamai returns 403 with a JS challenge page.
+    // The browser needs time to execute the challenge JS which sets cookies
+    // and then redirects to the real page. Wait for this to happen.
+    if (initialStatus === 403) {
+      log('  Got 403 (likely Akamai JS challenge). Waiting for challenge resolution...');
+      // Wait for Akamai challenge JS to execute and redirect
       try {
-        await page.waitForSelector(
-          '[data-testid="product-card"], [data-auto-id="product-card"], .product-card, article[data-index], a[href*=".html"]',
-          { timeout: 10000 }
-        );
-        log('  Product elements detected on page');
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        log(`  Post-challenge URL: ${page.url()}`);
       } catch {
-        log('  No product card selectors found, extracting what we can...');
+        log('  No navigation after challenge, waiting longer...');
       }
-
-      // Scroll to trigger lazy loading
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-      await page.waitForTimeout(1500);
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1500);
-
-      const products = await extractProducts(page);
-      for (const p of products) {
-        if (p.sku) allProducts.set(p.sku, p);
-      }
-      log(`  Collection page: ${products.length} products extracted`);
-    } else {
-      log(`  Collection page returned ${response?.status()}, may be WAF blocked`);
-      // Debug: dump page content
-      const content = await page.content();
-      log(`  Page content length: ${content.length}`);
-      log(`  First 500 chars: ${content.slice(0, 500)}`);
+      // Give extra time for any additional JS
+      await page.waitForTimeout(5000);
     }
+
+    // Now check current page state (may have changed after challenge)
+    const currentUrl = page.url();
+    const title = await page.title();
+    log(`  Current URL: ${currentUrl}`);
+    log(`  Page title: ${title}`);
+
+    // Debug: dump page content size and snippet
+    const content = await page.content();
+    log(`  Page content: ${content.length} chars`);
+    log(`  First 300 chars: ${content.slice(0, 300).replace(/\n/g, ' ')}`);
+
+    // Check if we actually got through (page title should not be just "adidas")
+    const isBlocked = content.length < 5000 && (title === 'adidas' || content.includes('var_country'));
+    if (isBlocked) {
+      log('  Still blocked by Akamai after challenge wait');
+    }
+
+    // Try to extract products regardless of whether we think we're blocked
+    // (the page might have partial content)
+    try {
+      await page.waitForSelector(
+        '[data-testid="product-card"], [data-auto-id="product-card"], .product-card, article[data-index], a[href*=".html"]',
+        { timeout: 10000 }
+      );
+      log('  Product elements detected on page');
+    } catch {
+      log('  No product card selectors found, extracting what we can...');
+    }
+
+    // Scroll to trigger lazy loading
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1500);
+
+    const products = await extractProducts(page);
+    for (const p of products) {
+      if (p.sku) allProducts.set(p.sku, p);
+    }
+    log(`  Collection page: ${products.length} products extracted`);
   } catch (err) {
     log(`  Collection page failed: ${err.message}`);
   }
 
-  // Scrape search pages
+  // Scrape search pages (after collection, cookies from Akamai challenge may carry over)
   for (const searchUrl of SEARCH_URLS) {
     try {
       log(`Navigating to: ${searchUrl}`);
       const response = await page.goto(searchUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: 45000,
+        timeout: 60000,
       });
-      log(`  Status: ${response?.status()}`);
+      const status = response?.status();
+      log(`  Initial status: ${status}`);
 
-      if (response?.status() === 200) {
+      if (status === 403) {
+        // Wait for Akamai challenge (cookies may already be set from collection page)
+        try {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 });
+        } catch {}
         await page.waitForTimeout(3000);
-
-        // Scroll to load more
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await page.waitForTimeout(1500);
-
-        const products = await extractProducts(page);
-        for (const p of products) {
-          if (p.sku && !allProducts.has(p.sku)) {
-            allProducts.set(p.sku, p);
-          }
-        }
-        log(`  Search page: ${products.length} products extracted`);
+      } else {
+        await page.waitForTimeout(3000);
       }
+
+      const content = await page.content();
+      log(`  Page content: ${content.length} chars`);
+
+      // Scroll to load more
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1500);
+
+      const products = await extractProducts(page);
+      for (const p of products) {
+        if (p.sku && !allProducts.has(p.sku)) {
+          allProducts.set(p.sku, p);
+        }
+      }
+      log(`  Search page: ${products.length} products extracted`);
     } catch (err) {
       log(`  Search page failed: ${err.message}`);
     }
