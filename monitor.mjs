@@ -511,16 +511,37 @@ async function runMonitor() {
 
   /**
    * Helper: extract Adidas Audi F1 product SKUs and URLs from HTML text
+   * Handles URL-encoded links from search engine redirect wrappers
    * @param {string} html - HTML content to search
    * @returns {Array} products found
    */
   function extractProductsFromHtml(html) {
     const results = [];
     const seen = new Set();
+
+    // First, URL-decode the entire HTML to catch encoded URLs
+    // Search engines encode links like: https%3A%2F%2Fwww.adidas.com%2Fus%2F...
+    let decoded = html;
+    try {
+      // Decode multiple times in case of double-encoding
+      decoded = decodeURIComponent(html.replace(/&amp;/g, '&'));
+    } catch {
+      // Partial decode: manually replace common encodings
+      decoded = html
+        .replace(/%3A/gi, ':')
+        .replace(/%2F/gi, '/')
+        .replace(/%3F/gi, '?')
+        .replace(/%3D/gi, '=')
+        .replace(/%26/gi, '&')
+        .replace(/%2B/gi, '+')
+        .replace(/%22/gi, '"')
+        .replace(/&amp;/g, '&');
+    }
+
     // Match Adidas product page URLs: /us/product-slug/SKU.html
-    const regex = /https?:\/\/(?:www\.)?adidas\.com\/us\/([^/"]+)\/([A-Z][A-Z0-9]{3,9})\.html/g;
+    const regex = /(?:https?:\/\/)?(?:www\.)?adidas\.com\/us\/([a-z0-9][a-z0-9-]+)\/([A-Z][A-Z0-9]{3,9})\.html/g;
     let match;
-    while ((match = regex.exec(html)) !== null) {
+    while ((match = regex.exec(decoded)) !== null) {
       const slug = match[1];
       const sku = match[2];
       if (!seen.has(sku)) {
