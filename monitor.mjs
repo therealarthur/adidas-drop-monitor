@@ -16,6 +16,14 @@ const SEARCH_URLS = [
   'https://www.adidas.com/us/search?q=audi+f1',
   'https://www.adidas.com/us/search?q=audi+revolut+f1',
 ];
+
+// Alternative data sources that bypass Akamai WAF
+const GOOGLE_CACHE_URL = 'https://webcache.googleusercontent.com/search?q=cache:www.adidas.com/us/audi_revolut_f1_team';
+const SITEMAP_URLS = [
+  'https://www.adidas.com/sitemap.xml',
+  'https://www.adidas.com/us/sitemap.xml',
+  'https://www.adidas.com/on/demandware.static/-/Sites-adidas-US-Library/default/sitemap_index.xml',
+];
 const TEST_MODE = process.argv.includes('--test-notify');
 
 // Notification config from env
@@ -618,6 +626,103 @@ async function runMonitor() {
       log(`  Search page: ${products.length} products extracted`);
     } catch (err) {
       log(`  Search page failed: ${err.message}`);
+    }
+  }
+
+  // FALLBACK: If Akamai blocked direct access, try Google Cache
+  if (allProducts.size === 0) {
+    log('Direct access blocked by Akamai. Trying Google Cache...');
+    try {
+      const cacheResp = await page.goto(GOOGLE_CACHE_URL, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+      log(`  Google Cache status: ${cacheResp?.status()}`);
+      if (cacheResp?.status() === 200) {
+        await page.waitForTimeout(2000);
+        const cacheContent = await page.content();
+        log(`  Google Cache content: ${cacheContent.length} chars`);
+        const products = await extractProducts(page);
+        for (const p of products) {
+          if (p.sku) allProducts.set(p.sku, p);
+        }
+        log(`  Google Cache: ${products.length} products extracted`);
+      }
+    } catch (err) {
+      log(`  Google Cache failed: ${err.message}`);
+    }
+  }
+
+  // FALLBACK 2: Try Google search for new products
+  if (allProducts.size === 0) {
+    log('Trying Google search for Adidas Audi F1 products...');
+    try {
+      await page.goto('https://www.google.com/search?q=site:adidas.com/us+%22audi+revolut+f1%22&num=50', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+      await page.waitForTimeout(2000);
+
+      // Extract product URLs from Google search results
+      const googleProducts = await page.evaluate(() => {
+        const results = [];
+        // Google search result links
+        const links = document.querySelectorAll('a[href*="adidas.com/us/"]');
+        for (const link of links) {
+          const href = link.getAttribute('href') || '';
+          const skuMatch = href.match(/\/us\/([^/]+)\/([A-Z][A-Z0-9]{3,9})\.html/);
+          if (skuMatch) {
+            const name = link.textContent.trim() || skuMatch[1].replace(/-/g, ' ');
+            results.push({
+              sku: skuMatch[2],
+              name: name.replace(/adidas/i, '').trim(),
+              price: '',
+              url: `https://www.adidas.com/us/${skuMatch[1]}/${skuMatch[2]}.html`,
+            });
+          }
+        }
+        return results;
+      });
+
+      for (const p of googleProducts) {
+        if (p.sku && !allProducts.has(p.sku)) {
+          allProducts.set(p.sku, p);
+        }
+      }
+      log(`  Google search: ${googleProducts.length} products found`);
+    } catch (err) {
+      log(`  Google search failed: ${err.message}`);
+    }
+  }
+
+  // FALLBACK 3: Try fetching sitemap for product URLs
+  if (allProducts.size === 0) {
+    log('Trying Adidas sitemaps...');
+    for (const sitemapUrl of SITEMAP_URLS) {
+      try {
+        const resp = await page.goto(sitemapUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15000,
+        });
+        if (resp?.status() === 200) {
+          const content = await page.content();
+          log(`  Sitemap ${sitemapUrl}: ${content.length} chars`);
+          // Extract product URLs from sitemap XML
+          const urls = content.match(/https:\/\/www\.adidas\.com\/us\/[^<]*?\/[A-Z][A-Z0-9]{3,9}\.html/g) || [];
+          const audiUrls = urls.filter(u => u.toLowerCase().includes('audi'));
+          log(`  Found ${urls.length} total product URLs, ${audiUrls.length} Audi-related`);
+          for (const url of audiUrls) {
+            const skuMatch = url.match(/\/([A-Z][A-Z0-9]{3,9})\.html/);
+            if (skuMatch && !allProducts.has(skuMatch[1])) {
+              const name = url.split('/us/')[1]?.split('/')[0]?.replace(/-/g, ' ') || skuMatch[1];
+              allProducts.set(skuMatch[1], { sku: skuMatch[1], name, price: '', url });
+            }
+          }
+        }
+      } catch (err) {
+        log(`  Sitemap ${sitemapUrl} failed: ${err.message}`);
+      }
+      if (allProducts.size > 0) break;
     }
   }
 
