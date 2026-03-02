@@ -27,6 +27,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium
+
       - name: Download previous state
         if: ${{ github.event.inputs.test_notify != 'true' }}
         uses: actions/cache@v4
@@ -35,41 +46,6 @@ jobs:
           key: adidas-monitor-state-${{ github.run_id }}
           restore-keys: |
             adidas-monitor-state-
-
-      - name: Send test notification
-        if: ${{ github.event.inputs.test_notify == 'true' }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
-          TWILIO_TO: ${{ secrets.TWILIO_TO }}
-        run: |
-          echo "Sending test notifications..."
-          MSG="[TEST] Adidas F1 Audi Drop Monitor is working! This is a test notification sent at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-
-          # Telegram
-          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            RESULT=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${MSG}\"}" 2>&1)
-            echo "Telegram response: $RESULT"
-          else
-            echo "Telegram not configured"
-          fi
-
-          # SMS
-          if [ -n "${TWILIO_SID:-}" ] && [ -n "${TWILIO_TOKEN:-}" ] && [ -n "${TWILIO_FROM:-}" ] && [ -n "${TWILIO_TO:-}" ]; then
-            RESULT=$(curl -sS -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json" \
-              -u "${TWILIO_SID}:${TWILIO_TOKEN}" \
-              -d "From=${TWILIO_FROM}" \
-              -d "To=${TWILIO_TO}" \
-              -d "Body=${MSG}" 2>&1)
-            echo "Twilio response: $RESULT"
-          else
-            echo "Twilio not configured"
-          fi
 
       - name: Run monitor
         if: ${{ github.event.inputs.test_notify != 'true' }}
@@ -80,6 +56,17 @@ jobs:
           TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
           TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
           TWILIO_TO: ${{ secrets.TWILIO_TO }}
-        run: |
-          chmod +x monitor.sh
-          bash monitor.sh
+          DEFAULT_SIZE: ${{ secrets.DEFAULT_SIZE }}
+        run: node monitor.mjs
+
+      - name: Send test notification
+        if: ${{ github.event.inputs.test_notify == 'true' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          TWILIO_TO: ${{ secrets.TWILIO_TO }}
+          DEFAULT_SIZE: ${{ secrets.DEFAULT_SIZE }}
+        run: node monitor.mjs --test-notify
